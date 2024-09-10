@@ -1,60 +1,103 @@
-'use client';
-import React, { useState, useCallback } from 'react';
-import {
-    generateSigner,
-    percentAmount,
-    signerIdentity,
-    publicKey,
-} from '@metaplex-foundation/umi';
-import { createUmi } from "@metaplex-foundation/umi-bundle-defaults";
-
-import { PublicKey } from '@metaplex-foundation/umi-public-keys';
-import {
-    createV1,
-    mplTokenMetadata,
-    TokenStandard,
-} from '@metaplex-foundation/mpl-token-metadata';
+'use client'
+import React, { useState, useCallback, useEffect } from 'react';
 import { useConnection, useWallet } from '@solana/wallet-adapter-react';
 import { WalletMultiButton } from '@solana/wallet-adapter-react-ui';
-import { Transaction as SolanaTransaction } from '@solana/web3.js';
+import { Keypair, SystemProgram, Transaction, PublicKey } from "@solana/web3.js";
+import {
+    MINT_SIZE, TOKEN_2022_PROGRAM_ID, createMintToInstruction,
+    createAssociatedTokenAccountInstruction, getMintLen,
+    createInitializeMetadataPointerInstruction, createInitializeMintInstruction,
+    ExtensionType, getAssociatedTokenAddressSync,
+    TYPE_SIZE,
+    LENGTH_SIZE,
+    getAccount,
+    createTransferInstruction
+} from "@solana/spl-token";
+import { createInitializeInstruction, pack } from '@solana/spl-token-metadata';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
-import { Rocket, Upload } from 'lucide-react';
+import { Rocket, Upload, RefreshCw } from 'lucide-react';
 import { useDropzone } from 'react-dropzone';
 
 import '@solana/wallet-adapter-react-ui/styles.css';
+import { getSignedURL } from '@/lib/utils';
+import SubtleLoadingSpinner from './Loader';
 
-const SPL_TOKEN_2022_PROGRAM_ID: PublicKey = publicKey(
-    'TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb'
-);
-
-async function uploadImage(file: File): Promise<string> {
-    return new Promise((resolve) => {
-        setTimeout(() => {
-            resolve(`https://example.com/images/${file.name}`);
-        }, 2000);
-    });
+async function uploadImage(file: File) {
+    try {
+        const signedUrlResult = await getSignedURL(file.name);
+        const url = signedUrlResult.success.url;
+        await fetch(url, {
+            method: 'PUT',
+            body: file,
+            headers: {
+                'Content-Type': file.type,
+            },
+        });
+        const fileUrl = url.split('?')[0];
+        return fileUrl;
+    } catch (error) {
+        console.error('Error uploading image:', error);
+        throw new Error('Failed to upload image.');
+    }
 }
 
-export function SolanaLaunchPad() {
+async function uploadMetadata(name: string, symbol: string, description: string, imageUrl: string) {
+    try {
+        const metadata = JSON.stringify({
+            name,
+            symbol,
+            description,
+            image: imageUrl
+        });
+
+        const metadataFile = new File([metadata], 'metadata.json', { type: 'application/json' });
+        const signedUrlResult = await getSignedURL('metadata.json');
+        const url = signedUrlResult.success.url;
+
+        await fetch(url, {
+            method: 'PUT',
+            body: metadataFile,
+            headers: {
+                'Content-Type': 'application/json',
+            },
+        });
+
+        const metadataUrl = url.split('?')[0];
+        return metadataUrl;
+    } catch (error) {
+        console.error('Error uploading metadata:', error);
+        throw new Error('Failed to upload metadata.');
+    }
+}
+
+export function SolanaLaunchpad() {
     const [tokenName, setTokenName] = useState('');
     const [tokenSymbol, setTokenSymbol] = useState('');
+    const [tokenDescription, setTokenDescription] = useState('');
     const [decimals, setDecimals] = useState(9);
-    const [supply, setSupply] = useState(1000000);
-    const [freezeAuthority, setFreezeAuthority] = useState(false);
-    const [isLaunching, setIsLaunching] = useState(false);
-    const [launchStatus, setLaunchStatus] = useState('');
+    const [supply, setSupply] = useState(1000000000);
     const [imageUrl, setImageUrl] = useState('');
     const [isUploading, setIsUploading] = useState(false);
-    const wallet = useWallet();
+    const [isLaunching, setIsLaunching] = useState(false);
+    const [launchStatus, setLaunchStatus] = useState('');
+    const [mounted, setMounted] = useState(false);
+    const [mintAddress, setMintAddress] = useState<string | null>(null);
+    const [tokenBalance, setTokenBalance] = useState<number | null>(null);
+
+    useEffect(() => {
+        setMounted(true);
+    }, []);
+
     const { connection } = useConnection();
+    const wallet = useWallet();
 
     const onDrop = useCallback(async (acceptedFiles: File[]) => {
         if (acceptedFiles.length > 0) {
             setIsUploading(true);
             try {
-                const url = await uploadImage(acceptedFiles[0]);
-                setImageUrl(url);
+                const fileUrl = await uploadImage(acceptedFiles[0]);
+                setImageUrl(fileUrl);
             } catch (error) {
                 console.error('Error uploading image:', error);
                 setLaunchStatus('Failed to upload image. Please try again.');
@@ -66,8 +109,8 @@ export function SolanaLaunchPad() {
 
     const { getRootProps, getInputProps, isDragActive } = useDropzone({ onDrop });
 
-    async function handleLaunch() {
-        if (!wallet.publicKey || !wallet.signTransaction || !wallet.signAllTransactions) {
+    async function createToken() {
+        if (!wallet.publicKey || !wallet.signTransaction) {
             setLaunchStatus('Please connect your wallet first.');
             return;
         }
@@ -81,52 +124,136 @@ export function SolanaLaunchPad() {
         setLaunchStatus('Launching token...');
 
         try {
-            const umiPublicKey = publicKey(wallet.publicKey.toBase58());
+            // Upload metadata
+            const metadataUrl = await uploadMetadata(tokenName, tokenSymbol, tokenDescription, imageUrl);
 
-            const customSigner = {
-                publicKey: umiPublicKey,
-                async signTransaction(transaction: any): Promise<any> {
-                    const solanaTransaction = transaction as unknown as SolanaTransaction;
-                    return wallet.signTransaction!(solanaTransaction) as unknown as any;
-                },
-                async signAllTransactions(transactions: any[]): Promise<any[]> {
-                    const solanaTransactions = transactions as unknown as SolanaTransaction[];
-                    const signedTransactions = await wallet.signAllTransactions!(solanaTransactions);
-                    return signedTransactions as unknown as any[];
-                },
-                async signMessage(message: Uint8Array): Promise<Uint8Array> {
-                    throw new Error('signMessage method not implemented.');
-                }
-            };
-            const umi = createUmi(connection)
-                .use(signerIdentity(customSigner))
-                .use(mplTokenMetadata());
-
-
-            umi.use(signerIdentity(customSigner));
-
-            const mint = generateSigner(umi);
-
-            const tx = createV1(umi, {
-                mint,
-                authority: umi.identity,
+            const mintKeypair = Keypair.generate();
+            const metadata = {
+                mint: mintKeypair.publicKey,
                 name: tokenName,
                 symbol: tokenSymbol,
-                uri: imageUrl,
-                sellerFeeBasisPoints: percentAmount(0),
-                decimals: decimals,
-                tokenStandard: TokenStandard.Fungible,
-                splTokenProgram: SPL_TOKEN_2022_PROGRAM_ID,
-            });
+                uri: metadataUrl,
+                additionalMetadata: [],
+            };
 
-            const result = await tx.sendAndConfirm(umi);
-            setLaunchStatus(`Token launched successfully! Mint address: ${mint.publicKey}`);
+            const mintLen = getMintLen([ExtensionType.MetadataPointer]);
+            const metadataLen = TYPE_SIZE + LENGTH_SIZE + pack(metadata).length;
+
+            const lamports = await connection.getMinimumBalanceForRentExemption(mintLen + metadataLen);
+
+            const transaction = new Transaction().add(
+                SystemProgram.createAccount({
+                    fromPubkey: wallet.publicKey,
+                    newAccountPubkey: mintKeypair.publicKey,
+                    space: mintLen,
+                    lamports,
+                    programId: TOKEN_2022_PROGRAM_ID,
+                }),
+                createInitializeMetadataPointerInstruction(
+                    mintKeypair.publicKey,
+                    wallet.publicKey,
+                    mintKeypair.publicKey,
+                    TOKEN_2022_PROGRAM_ID
+                ),
+                createInitializeMintInstruction(
+                    mintKeypair.publicKey,
+                    decimals,
+                    wallet.publicKey,
+                    null,
+                    TOKEN_2022_PROGRAM_ID
+                ),
+                createInitializeInstruction({
+                    programId: TOKEN_2022_PROGRAM_ID,
+                    mint: mintKeypair.publicKey,
+                    metadata: mintKeypair.publicKey,
+                    name: metadata.name,
+                    symbol: metadata.symbol,
+                    uri: metadata.uri,
+                    mintAuthority: wallet.publicKey,
+                    updateAuthority: wallet.publicKey,
+                })
+            );
+
+            transaction.feePayer = wallet.publicKey;
+            transaction.recentBlockhash = (await connection.getLatestBlockhash()).blockhash;
+            transaction.partialSign(mintKeypair);
+
+            await wallet.sendTransaction(transaction, connection);
+
+            console.log(`Token mint created at ${mintKeypair.publicKey.toBase58()}`);
+            const associatedToken = getAssociatedTokenAddressSync(
+                mintKeypair.publicKey,
+                wallet.publicKey,
+                false,
+                TOKEN_2022_PROGRAM_ID,
+            );
+
+            console.log(associatedToken.toBase58());
+
+            const transaction2 = new Transaction().add(
+                createAssociatedTokenAccountInstruction(
+                    wallet.publicKey,
+                    associatedToken,
+                    wallet.publicKey,
+                    mintKeypair.publicKey,
+                    TOKEN_2022_PROGRAM_ID
+                )
+            );
+
+            await wallet.sendTransaction(transaction2, connection);
+
+            const transaction3 = new Transaction().add(
+                createMintToInstruction(
+                    mintKeypair.publicKey,
+                    associatedToken,
+                    wallet.publicKey,
+                    supply * Math.pow(10, decimals),
+                    [],
+                    TOKEN_2022_PROGRAM_ID
+                )
+            );
+
+            await wallet.sendTransaction(transaction3, connection);
+
+            setMintAddress(mintKeypair.publicKey.toBase58());
+            setLaunchStatus(`Token launched and minted successfully! Mint address: ${mintKeypair.publicKey.toBase58()}`);
+            await getTokenBalance(mintKeypair.publicKey);
+
         } catch (error: any) {
             console.error('Error launching token:', error);
             setLaunchStatus(`Error launching token: ${error.message}`);
         } finally {
             setIsLaunching(false);
         }
+    }
+
+    async function getTokenBalance(mintPublicKey: PublicKey) {
+        if (!wallet.publicKey) return;
+
+        try {
+            const associatedTokenAddress = getAssociatedTokenAddressSync(
+                mintPublicKey,
+                wallet.publicKey,
+                false,
+                TOKEN_2022_PROGRAM_ID
+            );
+
+            const tokenAccount = await getAccount(connection, associatedTokenAddress, 'confirmed', TOKEN_2022_PROGRAM_ID);
+            setTokenBalance(Number(tokenAccount.amount) / Math.pow(10, decimals));
+        } catch (error) {
+            console.error('Error fetching token balance:', error);
+            setTokenBalance(null);
+        }
+    }
+
+    async function refreshBalance() {
+        if (mintAddress) {
+            await getTokenBalance(new PublicKey(mintAddress));
+        }
+    }
+
+    if (!mounted) {
+        return <SubtleLoadingSpinner />;
     }
 
     return (
@@ -145,14 +272,21 @@ export function SolanaLaunchPad() {
                         <Input
                             placeholder="Token Name"
                             value={tokenName}
-                            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setTokenName(e.target.value)}
+                            onChange={(e) => setTokenName(e.target.value)}
                             className="w-full"
                             disabled={!wallet.connected}
                         />
                         <Input
                             placeholder="Token Symbol"
                             value={tokenSymbol}
-                            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setTokenSymbol(e.target.value)}
+                            onChange={(e) => setTokenSymbol(e.target.value)}
+                            className="w-full"
+                            disabled={!wallet.connected}
+                        />
+                        <Input
+                            placeholder="Token Description"
+                            value={tokenDescription}
+                            onChange={(e) => setTokenDescription(e.target.value)}
                             className="w-full"
                             disabled={!wallet.connected}
                         />
@@ -160,7 +294,7 @@ export function SolanaLaunchPad() {
                             type="number"
                             placeholder="Decimals"
                             value={decimals}
-                            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setDecimals(parseInt(e.target.value))}
+                            onChange={(e) => setDecimals(parseInt(e.target.value))}
                             className="w-full"
                             disabled={!wallet.connected}
                         />
@@ -168,20 +302,10 @@ export function SolanaLaunchPad() {
                             type="number"
                             placeholder="Initial Supply"
                             value={supply}
-                            onChange={(e: React.ChangeEvent<HTMLInputElement>) => setSupply(parseInt(e.target.value))}
+                            onChange={(e) => setSupply(parseInt(e.target.value))}
                             className="w-full"
                             disabled={!wallet.connected}
                         />
-                        <label className="flex items-center space-x-2 cursor-pointer">
-                            <input
-                                type="checkbox"
-                                checked={freezeAuthority}
-                                onChange={(e: React.ChangeEvent<HTMLInputElement>) => setFreezeAuthority(e.target.checked)}
-                                className="form-checkbox h-5 w-5 text-blue-600"
-                                disabled={!wallet.connected}
-                            />
-                            <span className="text-gray-700">Enable Freeze Authority</span>
-                        </label>
                     </div>
 
                     <div
@@ -211,7 +335,7 @@ export function SolanaLaunchPad() {
                     </div>
 
                     <Button
-                        onClick={handleLaunch}
+                        onClick={createToken}
                         disabled={isLaunching || !wallet.connected || !imageUrl}
                         className="w-full bg-gradient-to-r from-blue-500 to-indigo-600 hover:from-blue-600 hover:to-indigo-700 text-white font-semibold py-3 rounded-lg shadow-md hover:shadow-lg transition duration-300 flex items-center justify-center"
                     >
@@ -224,10 +348,22 @@ export function SolanaLaunchPad() {
                             {launchStatus}
                         </p>
                     </div>
+
+                    {mintAddress && (
+                        <div className="bg-gray-100 p-4 rounded-lg mt-4">
+                            <h3 className="text-lg font-semibold mb-2">Token Information</h3>
+                            <p><strong>Mint Address:</strong> {mintAddress}</p>
+                            <p><strong>Balance:</strong> {tokenBalance !== null ? `${tokenBalance} ${tokenSymbol}` : 'Loading...'}</p>
+                            <Button onClick={refreshBalance} className="mt-2 flex items-center">
+                                <RefreshCw className="mr-2" />
+                                Refresh Balance
+                            </Button>
+                        </div>
+                    )}
                 </div>
             </main>
         </div>
     );
 }
 
-export default SolanaLaunchPad;
+export default SolanaLaunchpad;
